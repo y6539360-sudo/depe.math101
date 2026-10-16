@@ -7,11 +7,16 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+
+// Parse CLI port arguments or fallback to env / 3000
+const args = process.argv.slice(2);
+const portIndex = args.indexOf('--port');
+const cliPort = portIndex !== -1 && args[portIndex + 1] ? parseInt(args[portIndex + 1], 10) : null;
+const PORT = cliPort || (process.env.PORT ? parseInt(process.env.PORT, 10) : 3000);
 
 app.use(express.json());
 
-// Passkey verification - checked securely on the server
+// Passkey verification endpoint - the passkey is kept on the server only
 // The client HTML, JS, and CSS files NEVER have the plaintext passkey embedded
 const PASSKEY = process.env.APP_PASSKEY || 'math/101';
 
@@ -21,7 +26,6 @@ app.post('/api/verify-passkey', (req, res) => {
     return res.status(400).json({ success: false, message: 'Passkey is required.' });
   }
 
-  // Exact comparison against server secret
   if (passkey.trim() === PASSKEY) {
     const timestamp = Date.now();
     const token = Buffer.from(`session_${timestamp}_authorized`).toString('base64');
@@ -54,19 +58,66 @@ app.get('/api/games', (_req, res) => {
   }
 });
 
+// Always serve public directory for static game iframes and assets
+app.use(express.static(path.resolve(__dirname, 'public')));
+
+// Fallback alias for /main.tsx to /src/main.tsx
+app.get('/main.tsx', (_req, res) => {
+  res.redirect('/src/main.tsx');
+});
+
 async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
+  const distPath = path.resolve(__dirname, 'dist');
+  const hasDist = fs.existsSync(path.resolve(distPath, 'index.html'));
 
-  if (!isProd) {
+  if (!isProd || !hasDist) {
+    // Development mode with Vite middleware
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
+      root: __dirname,
+      server: {
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR !== 'true',
+        watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      },
+      appType: 'custom',
     });
+
+    // Vite development middlewares (handles /src/main.tsx, /@vite/client, etc.)
     app.use(vite.middlewares);
+
+    // Serve transformed index.html for all non-API web requests
+    app.use('*', async (req, res, next) => {
+      const url = req.originalUrl;
+      if (url.startsWith('/api') || url.startsWith('/games/')) {
+        return next();
+      }
+      try {
+        const indexPath = path.resolve(__dirname, 'index.html');
+        let template = fs.readFileSync(indexPath, 'utf-8');
+        template = await vite.transformIndexHtml(url, template);
+        res.status(200).set({ 'Content-Type': 'text/html' }).end(template);
+      } catch (e) {
+        vite.ssrFixStacktrace(e as Error);
+        next(e);
+      }
+    });
   } else {
-    const distPath = path.resolve(__dirname, 'dist');
+    // Production mode
     app.use(express.static(distPath));
+
+    // If /src/main.tsx is ever requested in production by stale cached HTML, serve index bundle
+    app.get('/src/main.tsx', (_req, res) => {
+      const assets = fs.readdirSync(path.resolve(distPath, 'assets'));
+      const jsBundle = assets.find((f) => f.endsWith('.js'));
+      if (jsBundle) {
+        res.redirect(`/assets/${jsBundle}`);
+      } else {
+        res.status(404).end();
+      }
+    });
+
     app.get('*', (_req, res) => {
       res.sendFile(path.resolve(distPath, 'index.html'));
     });
